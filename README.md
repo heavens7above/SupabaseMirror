@@ -53,5 +53,3 @@ The project includes utility scripts for state management:
 ## 📝 License
 
 Distributed under the MIT License. See `LICENSE` for more information.
-
-Built with ❤️ for the open-source community.
