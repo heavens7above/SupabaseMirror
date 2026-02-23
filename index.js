@@ -82,13 +82,15 @@ app.post("/supabase-webhook", async (req, res) => {
     return res.status(200).send("Duplicate");
   }
 
+  const webhookSecret = (process.env.SUPABASE_WEBHOOK_SECRET || "").replace(/^"|"$/g, '');
+
   if (
     !syncLogic.verifySupabaseSignature(
       req.rawBody,
       signature,
-      process.env.SUPABASE_WEBHOOK_SECRET,
+      webhookSecret,
     ) && 
-    req.headers["x-webhook-secret"] !== process.env.SUPABASE_WEBHOOK_SECRET
+    req.headers["x-webhook-secret"] !== webhookSecret
   ) {
     logger.error("Invalid Supabase signature or secret header", { eventId });
     return res.status(401).send("Unauthorized: Invalid Signature or Secret");
