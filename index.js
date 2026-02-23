@@ -26,15 +26,6 @@ app.use(
   }),
 );
 
-// Global Request Tracer
-app.use((req, res, next) => {
-  logger.info(`[INCOMING] ${req.method} ${req.path}`, {
-    ua: req.headers["user-agent"],
-    ip: req.headers["x-forwarded-for"] || req.ip
-  });
-  next();
-});
-
 // Health Check Endpoint
 app.get("/health", async (req, res) => {
   try {
@@ -71,9 +62,6 @@ async function logSyncError(source, payload, error) {
 
 // Supabase Webhook Endpoint
 app.post("/supabase-webhook", async (req, res) => {
-  // DEBUG: Log the entire raw body if signature verification is suspicious
-  console.log(`[DEBUG] Raw Supabase Webhook Body: ${req.rawBody}`);
-  
   const eventId = req.headers["x-supabase-event-id"];
   const signature = req.headers["x-supabase-signature"];
   const tableName = req.body.table;
