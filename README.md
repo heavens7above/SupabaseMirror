@@ -88,7 +88,3 @@ NODE_ENV=production
 - **Initial Backfill**: `npm run backfill` reads all Supabase rows and seeds the Google Sheet.
 - **Reconciliation**: `npm run reconcile` performs a bidirectional comparison and fixes any drifted data. It is recommended to run this as a cron job every 15-30 minutes.
 - **Health Check**: `GET /health` monitors the service status and Redis connectivity.
-
-## 🛡 Security Note
-
-Never commit your `.env` or service account JSON files. Use the provided `.gitignore` and manage secrets via your deployment platform.
