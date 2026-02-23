@@ -86,10 +86,11 @@ app.post("/supabase-webhook", async (req, res) => {
       req.rawBody,
       signature,
       process.env.SUPABASE_WEBHOOK_SECRET,
-    )
+    ) && 
+    req.headers["x-webhook-secret"] !== process.env.SUPABASE_WEBHOOK_SECRET
   ) {
-    logger.error("Invalid Supabase signature", { eventId });
-    return res.status(401).send("Unauthorized: Invalid Signature");
+    logger.error("Invalid Supabase signature or secret header", { eventId });
+    return res.status(401).send("Unauthorized: Invalid Signature or Secret");
   }
 
   const { record, old_record, type } = req.body;
