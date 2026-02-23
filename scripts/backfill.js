@@ -4,7 +4,8 @@ const redis = require('../lib/redis-client');
 const syncLogic = require('../lib/sync-logic');
 
 async function backfill() {
-  console.log('Starting backfill...');
+  const tableName = process.argv[2] || process.env.SUPABASE_TABLE_NAME || 'menu_items';
+  console.log(`Starting backfill for table: ${tableName}...`);
   
   try {
     // 1. Fetch all rows from Supabase
@@ -16,7 +17,7 @@ async function backfill() {
 
     while (hasMore) {
       const { data, error } = await supabase
-        .from('synced_table') // Replace with your table name
+        .from(tableName)
         .select('*')
         .range(offset, offset + limit - 1)
         .order('id', { ascending: true });
@@ -35,11 +36,19 @@ async function backfill() {
     const batchSize = 500;
     for (let i = 0; i < allRecords.length; i += batchSize) {
       const batch = allRecords.slice(i, i + batchSize);
-      const values = batch.map(record => syncLogic.mapSupabaseToSheets(record));
+      // Fetch headers from the target sheet
+      const headerResponse = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${tableName}!1:1`,
+      });
+      const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+      if (headers.length === 0) throw new Error(`Sheet '${tableName}' has no headers.`);
+
+      const values = batch.map(record => syncLogic.mapSupabaseToSheets(record, headers));
       
       await sheets.spreadsheets.values.append({
         spreadsheetId: sheetId,
-        range: 'Sheet1!A2',
+        range: `${tableName}!1:1`,
         valueInputOption: 'USER_ENTERED',
         resource: { values },
       });
@@ -54,17 +63,17 @@ async function backfill() {
     }
 
     // 4. Update Redis id -> rowIndex mapping
-    console.log('Updating Redis row index cache...');
+    console.log(`Updating Redis row index cache for ${tableName}...`);
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
-      range: 'Sheet1!A:A',
+      range: `${tableName}!A:A`,
     });
     const rows = response.data.values || [];
     const multi = redis.multi();
     rows.forEach((row, index) => {
       if (index === 0) return; // Skip header
       if (row[0]) {
-        multi.set(`rowindex:${row[0]}`, index + 1);
+        multi.set(`rowindex:${tableName}:${row[0]}`, index + 1);
       }
     });
     await multi.exec();

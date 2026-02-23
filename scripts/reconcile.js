@@ -5,20 +5,22 @@ const logger = require('../lib/logger');
 const pRetry = require('p-retry');
 
 async function reconcile() {
-  logger.info('Running reconciliation job...');
+  const tableName = process.argv[2] || process.env.SUPABASE_TABLE_NAME || 'menu_items';
+  logger.info(`Running reconciliation job for table: ${tableName}...`);
 
   try {
     const { data: supabaseRecords, error } = await pRetry(() => supabase
-      .from('synced_table')
+      .from(tableName)
       .select('*'), { retries: 3 });
     if (error) throw error;
 
     const sheetsResponse = await pRetry(() => sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
-      range: 'Sheet1!A:E',
+      range: `${tableName}!1:5000`, // Support bulk fetch
     }), { retries: 3 });
     const sheetsRows = sheetsResponse.data.values || [];
-    const sheetsData = sheetsRows.slice(1).map(row => syncLogic.mapSheetsToSupabase(row));
+    const headers = sheetsRows[0] || [];
+    const sheetsData = sheetsRows.slice(1).map(row => syncLogic.mapSheetsToSupabase(row, headers));
 
     const supabaseMap = new Map(supabaseRecords.map(r => [r.id, r]));
     const sheetsMap = new Map(sheetsData.map(r => [r.id, r]));
@@ -32,11 +34,11 @@ async function reconcile() {
 
       if (!supabaseRecord && sheetsRecord) {
         logger.info(`Row ${id} missing in Supabase. Adding...`);
-        const record = syncLogic.mapSheetsToSupabase(sheetsRecord);
-        await pRetry(() => supabase.from('synced_table').upsert(record), { retries: 3 });
+        const record = syncLogic.mapSheetsToSupabase(sheetsRecord, headers);
+        await pRetry(() => supabase.from(tableName).upsert(record), { retries: 3 });
       } else if (supabaseRecord && !sheetsRecord) {
         logger.info(`Row ${id} missing in Sheets. Queuing add...`);
-        sheetUpdates.push(syncLogic.mapSupabaseToSheets(supabaseRecord));
+        sheetUpdates.push(syncLogic.mapSupabaseToSheets(supabaseRecord, headers));
       } else if (supabaseRecord && sheetsRecord) {
         const sTime = new Date(supabaseRecord.synced_at).getTime();
         const shTime = new Date(sheetsRecord.synced_at).getTime();
@@ -44,10 +46,10 @@ async function reconcile() {
         if (Math.abs(sTime - shTime) > 5000) {
           logger.info(`Discrepancy found for row ${id}. Resolving...`);
           if (sTime > shTime) {
-            sheetUpdates.push(syncLogic.mapSupabaseToSheets(supabaseRecord));
+            sheetUpdates.push(syncLogic.mapSupabaseToSheets(supabaseRecord, headers));
           } else {
-            const record = syncLogic.mapSheetsToSupabase(sheetsRecord);
-            await pRetry(() => supabase.from('synced_table').upsert(record), { retries: 3 });
+            const record = syncLogic.mapSheetsToSupabase(sheetsRecord, headers);
+            await pRetry(() => supabase.from(tableName).upsert(record), { retries: 3 });
           }
         }
       }
@@ -57,7 +59,7 @@ async function reconcile() {
       logger.info(`Pushing ${sheetUpdates.length} updates to Sheets...`);
       await pRetry(() => sheets.spreadsheets.values.append({
         spreadsheetId: sheetId,
-        range: 'Sheet1!A1',
+        range: `${tableName}!1:1`,
         valueInputOption: 'USER_ENTERED',
         resource: { values: sheetUpdates },
       }), { retries: 3 });

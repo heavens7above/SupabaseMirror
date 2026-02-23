@@ -63,16 +63,17 @@ async function logSyncError(source, payload, error) {
 app.post("/supabase-webhook", async (req, res) => {
   const eventId = req.headers["x-supabase-event-id"];
   const signature = req.headers["x-supabase-signature"];
+  const tableName = req.body.table;
 
   logger.info("Received Supabase webhook", {
     eventId,
-    table: req.body.table,
+    table: tableName,
     type: req.body.type,
   });
 
   // Basic Payload Validation
-  if (!req.body.type || (!req.body.record && !req.body.old_record)) {
-    return res.status(400).send("Invalid payload structure");
+  if (!req.body.type || (!req.body.record && !req.body.old_record) || !tableName) {
+    return res.status(400).send("Invalid payload structure or missing table name");
   }
 
   if (await syncLogic.isDuplicateEvent(eventId)) {
@@ -104,15 +105,29 @@ app.post("/supabase-webhook", async (req, res) => {
   try {
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
-        const rowData = syncLogic.mapSupabaseToSheets(record);
-        let rowIndex = await redis.get(`rowindex:${rowId}`);
+        // Fetch headers from the sheet to ensure correct column mapping
+        const headerResponse = await pRetry(
+          () =>
+            sheets.spreadsheets.values.get({
+              spreadsheetId: sheetId,
+              range: `${tableName}!1:1`,
+            }),
+          { retries: 3 },
+        );
+        const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+        if (headers.length === 0) {
+          throw new Error(`Target sheet '${tableName}' has no headers.`);
+        }
+
+        const rowData = syncLogic.mapSupabaseToSheets(record, headers);
+        let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`);
 
         if (!rowIndex) {
           const response = await pRetry(
             () =>
               sheets.spreadsheets.values.get({
                 spreadsheetId: sheetId,
-                range: "Sheet1!A:A",
+                range: `${tableName}!A:A`,
               }),
             { retries: 3 },
           );
@@ -120,7 +135,7 @@ app.post("/supabase-webhook", async (req, res) => {
           const index = rows.findIndex((r) => r[0] === rowId);
           if (index !== -1) {
             rowIndex = index + 1;
-            await redis.set(`rowindex:${rowId}`, rowIndex);
+            await redis.set(`rowindex:${tableName}:${rowId}`, rowIndex);
           }
         }
 
@@ -129,25 +144,25 @@ app.post("/supabase-webhook", async (req, res) => {
             () =>
               sheets.spreadsheets.values.update({
                 spreadsheetId: sheetId,
-                range: `Sheet1!A${rowIndex}`,
+                range: `${tableName}!A${rowIndex}`,
                 valueInputOption: "USER_ENTERED",
                 resource: { values: [rowData] },
               }),
             { retries: 3 },
           );
-          logger.info("Updated Sheets row", { rowId, rowIndex });
+          logger.info("Updated Sheets row", { table: tableName, rowId, rowIndex });
         } else {
           await pRetry(
             () =>
               sheets.spreadsheets.values.append({
                 spreadsheetId: sheetId,
-                range: "Sheet1!A1",
+                range: `${tableName}!1:1`,
                 valueInputOption: "USER_ENTERED",
                 resource: { values: [rowData] },
               }),
             { retries: 3 },
           );
-          logger.info("Appended new Sheets row", { rowId });
+          logger.info("Appended new Sheets row", { table: tableName, rowId });
         }
       });
     }
@@ -163,13 +178,13 @@ app.post("/supabase-webhook", async (req, res) => {
 
 // Google Sheets Webhook Endpoint
 app.post("/sheets-webhook", async (req, res) => {
-  const { row, timestamp } = req.body;
-  if (!row || !row[0]) return res.status(400).send("Invalid row data");
+  const { row, timestamp, table } = req.body;
+  if (!row || !row[0] || !table) return res.status(400).send("Invalid row data or missing table name");
 
   const rowId = row[0];
   const sheetsSyncedAt = new Date(timestamp);
 
-  logger.info("Received Sheets webhook", { rowId, timestamp });
+  logger.info("Received Sheets webhook", { table, rowId, timestamp });
 
   if (!(await syncLogic.acquireLock(rowId))) {
     logger.info("Lock active, skipping sheets-webhook", { rowId });
@@ -177,10 +192,21 @@ app.post("/sheets-webhook", async (req, res) => {
   }
 
   try {
+    // Fetch headers to perform correct reverse mapping
+    const headerResponse = await pRetry(
+      () =>
+        sheets.spreadsheets.values.get({
+          spreadsheetId: sheetId,
+          range: `${table}!1:1`,
+        }),
+      { retries: 3 },
+    );
+    const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+
     const { data: currentRecord } = await pRetry(
       () =>
         supabase
-          .from(process.env.SUPABASE_TABLE_NAME || "synced_table")
+          .from(table)
           .select("synced_at")
           .eq("id", rowId)
           .single(),
@@ -198,14 +224,14 @@ app.post("/sheets-webhook", async (req, res) => {
       }
     }
 
-    const supabaseRecord = syncLogic.mapSheetsToSupabase(row);
+    const supabaseRecord = syncLogic.mapSheetsToSupabase(row, headers);
     supabaseRecord.synced_at = sheetsSyncedAt.toISOString();
     supabaseRecord.source = "sheets";
 
     const { error } = await pRetry(
       () =>
         supabase
-          .from(process.env.SUPABASE_TABLE_NAME || "synced_table")
+          .from(table)
           .upsert(supabaseRecord, { onConflict: "id" }),
       { retries: 3 },
     );

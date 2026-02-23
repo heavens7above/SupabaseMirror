@@ -34,6 +34,7 @@ function onEdit(e) {
 
     const payload = {
       row: rowData,
+      table: sheet.getName(),
       timestamp: new Date().toISOString(),
     };
 
