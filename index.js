@@ -89,9 +89,15 @@ app.post("/supabase-webhook", async (req, res) => {
     return res.status(400).send("Invalid payload structure or missing table name");
   }
 
-  if (await syncLogic.isDuplicateEvent(eventId)) {
+  if (eventId && (await syncLogic.isDuplicateEvent(eventId))) {
     logger.warn("Duplicate event dropped", { eventId });
     return res.status(200).send("Duplicate");
+  }
+
+  // Loop Prevention: If this change originated from Sheets, don't sync it back
+  if (req.body.record && req.body.record.source === "sheets") {
+    logger.info("Skipping supabase-webhook: Origin is Sheets", { eventId });
+    return res.status(200).send("Skipped loop");
   }
 
   const webhookSecret = (process.env.SUPABASE_WEBHOOK_SECRET || "").replace(/^"|"$/g, '');
@@ -241,8 +247,8 @@ app.post("/sheets-webhook", async (req, res) => {
     }
 
     const supabaseRecord = syncLogic.mapSheetsToSupabase(row, headers);
+    supabaseRecord.source = "sheets"; // Tag origin for loop prevention
     supabaseRecord.synced_at = sheetsSyncedAt.toISOString();
-    supabaseRecord.source = "sheets";
 
     const { error } = await pRetry(
       () =>
