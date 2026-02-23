@@ -1,7 +1,7 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const helmet = require("helmet");
-const pRetry = require("p-retry");
+const { default: pRetry } = require("p-retry");
 const supabase = require("./lib/supabase-client");
 const { sheets, sheetId } = require("./lib/sheets-client");
 const redis = require("./lib/redis-client");

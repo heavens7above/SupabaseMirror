@@ -2,7 +2,7 @@ const supabase = require('../lib/supabase-client');
 const { sheets, sheetId } = require('../lib/sheets-client');
 const syncLogic = require('../lib/sync-logic');
 const logger = require('../lib/logger');
-const pRetry = require('p-retry');
+const { default: pRetry } = require('p-retry');
 
 async function reconcile() {
   const tableName = process.argv[2] || process.env.SUPABASE_TABLE_NAME || 'menu_items';
