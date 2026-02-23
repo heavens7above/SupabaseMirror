@@ -1,0 +1,29 @@
+{
+  "name": "postgresmirror",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "backfill": "node scripts/backfill.js",
+    "reconcile": "node scripts/reconcile.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.97.0",
+    "body-parser": "^2.2.2",
+    "crypto": "^1.0.1",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "googleapis": "^171.4.0",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.9.3",
+    "p-queue": "^9.1.0",
+    "p-retry": "^7.1.1",
+    "winston": "^3.19.0"
+  }
+}
