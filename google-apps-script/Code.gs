@@ -3,8 +3,7 @@
  * To be installed as a "Bound" script in the Google Sheet.
  */
 
-const MIDDLEWARE_URL =
-  "https://supabasemirror-production.up.railway.app/sheets-webhook"; // Update with your deployed URL
+const MIDDLEWARE_URL = "https://xyz.com/sheets-webhook"; // Update with your deployed URL
 
 /**
  * Triggered on any edit in the spreadsheet.
