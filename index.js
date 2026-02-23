@@ -39,7 +39,10 @@ app.get("/health", async (req, res) => {
 
 // Helper: Log Sync Error to Supabase (DLQ)
 async function logSyncError(source, payload, error) {
-  logger.error(`Sync error from ${source}`, { error: error.message, payload });
+  // CRITICAL: Log full error to console for Railway debugging
+  console.error(`[CRITICAL ERROR] Source: ${source}, Message: ${error.message}`);
+  if (error.stack) console.error(error.stack);
+  
   try {
     await pRetry(
       () =>
@@ -53,9 +56,7 @@ async function logSyncError(source, payload, error) {
       { retries: 3 },
     );
   } catch (dbError) {
-    logger.error("Failed to log sync error to Supabase", {
-      error: dbError.message,
-    });
+    console.error(`[META ERROR] Failed to log to Supabase: ${dbError.message}`);
   }
 }
 
