@@ -62,21 +62,26 @@ async function backfill() {
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
-    // 4. Update Redis id -> rowIndex mapping
-    console.log(`Updating Redis row index cache for ${tableName}...`);
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: sheetId,
-      range: `${tableName}!A:A`,
-    });
-    const rows = response.data.values || [];
-    const multi = redis.multi();
-    rows.forEach((row, index) => {
-      if (index === 0) return; // Skip header
-      if (row[0]) {
-        multi.set(`rowindex:${tableName}:${row[0]}`, index + 1);
-      }
-    });
-    await multi.exec();
+    // 4. Update Redis row index cache for tableName (Optional)
+    try {
+      console.log(`Attempting to update Redis row index cache for ${tableName}...`);
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `${tableName}!A:A`,
+      });
+      const rows = response.data.values || [];
+      const multi = redis.multi();
+      rows.forEach((row, index) => {
+        if (index === 0) return; // Skip header
+        if (row[0]) {
+          multi.set(`rowindex:${tableName}:${row[0]}`, index + 1);
+        }
+      });
+      await multi.exec();
+      console.log('Redis cache updated successfully.');
+    } catch (redisError) {
+      console.warn(`Skipping Redis cache update: ${redisError.message}`);
+    }
 
     console.log('Backfill completed successfully.');
   } catch (error) {
