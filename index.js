@@ -121,13 +121,15 @@ app.post("/supabase-webhook", async (req, res) => {
       const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
       const lastFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
 
-      logger.info("Loop Check (Fingerprint)", { 
+      logger.info(`Loop Check: rowId=${rowId} match=${incomingFingerprint === lastFingerprint}`, { 
         rowId, 
-        isMatch: incomingFingerprint === lastFingerprint
+        isMatch: incomingFingerprint === lastFingerprint,
+        incoming: incomingFingerprint,
+        stored: lastFingerprint
       });
 
       if (incomingFingerprint === lastFingerprint) {
-        logger.info("Skipping supabase-webhook: Exact content echo detected", { eventId, rowId });
+        logger.info(`Skipping supabase-webhook: Exact content echo detected for ${rowId}`);
         return res.status(200).send("Skipped loop");
       }
     }
@@ -229,12 +231,12 @@ app.post("/sheets-webhook", async (req, res) => {
         const currentFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
 
         if (incomingFingerprint === currentFingerprint) {
-          logger.info("Dropping stale but identical Sheets update", { rowId });
+          logger.info(`Dropping stale but identical Sheets update for ${rowId}`);
           return res.status(200).send("Dropped (Identical)");
         }
 
         logger.info(
-          "Conflict: Supabase record is newer. Dropping Sheets update.",
+          `Conflict Detected! Supabase record is newer for ${rowId}`,
           { rowId },
         );
         return res.status(200).send("Dropped due to conflict");
