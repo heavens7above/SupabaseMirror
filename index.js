@@ -212,6 +212,7 @@ app.post("/supabase-webhook", async (req, res) => {
 
       if (incomingFingerprint === storedFingerprint && !isShifted) {
         logger.info(`Loop Check: rowId=${rowId} match=true. Skipping local echo.`);
+        localLocks.delete(lockKey);
         return res.status(200).send("Skipped loop");
       }
       
@@ -400,10 +401,17 @@ app.post("/sheets-webhook", async (req, res) => {
         await redis.set(`shifted:${table}:${rowId}`, 'true', 'EX', 60).catch(() => {});
       }
 
-      // FK VALIDATION: Check if category_id exists (if present)
+      // FK VALIDATION: Only discard category_id when Redis CONFIRMS it's invalid.
+      // If Redis is down, always preserve the category_id to avoid FK violations.
       if (incomingRecord.category_id) {
-        const isValid = await redis.sismember('valid_categories', incomingRecord.category_id).catch(() => 1);
-        if (!isValid) {
+        let fkCheckResult = null;
+        try {
+          fkCheckResult = await redis.sismember('valid_categories', incomingRecord.category_id);
+        } catch (e) {
+          // Redis unavailable — skip check, preserve category_id
+          fkCheckResult = 1;
+        }
+        if (!fkCheckResult) {
           logger.warn(`Discarding invalid category_id: ${incomingRecord.category_id} (Not found in Supabase)`);
           incomingRecord.category_id = null;
         }
@@ -416,6 +424,7 @@ app.post("/sheets-webhook", async (req, res) => {
 
       if (incomingFingerprint === effectiveLastFingerprint) {
         logger.info(`Dropping duplicate/local-echo Sheets update for ${rowId}`);
+        localLocks.delete(lockKey);
         return res.status(200).send("Dropped (Duplicate)");
       }
 
@@ -461,8 +470,9 @@ app.post("/sheets-webhook", async (req, res) => {
 
     logger.info("Upserted Supabase record from Sheets", { rowId });
     
-    // Store fingerprint to prevent infinite loops (using incoming fingerprint for stability)
-    await redis.set(`lastfingerprint:${table}:${rowId}`, incomingFingerprint, 'EX', 3600);
+    // Store fingerprint to prevent infinite loops — must have .catch() since Redis may be down
+    await redis.set(`lastfingerprint:${table}:${rowId}`, incomingFingerprint, 'EX', 3600).catch(() => {});
+    localFingerprints.set(`${table}:${rowId}`, incomingFingerprint);
     
     res.status(200).send("OK");
     } finally {
