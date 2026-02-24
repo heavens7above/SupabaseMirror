@@ -149,17 +149,13 @@ app.post("/supabase-webhook", async (req, res) => {
       throw new Error(`Target sheet '${tableName}' has no headers.`);
     }
 
-    // Refined Loop Prevention: Only fingerprint keys that exist in the SHEET
-    if (req.body.record && req.body.record.source === "sheets") {
-      const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
-      const storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
-      const isShifted = await redis.get(`shifted:${tableName}:${rowId}`);
+    // Refined Loop Prevention: Always check fingerprint to prevent echoing our own changes
+    const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
+    const storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
+    const isShifted = await redis.get(`shifted:${tableName}:${rowId}`);
 
-      logger.info(`Loop Check: rowId=${rowId} match=${incomingFingerprint === storedFingerprint} shifted=${!!isShifted}`, { 
-        rowId, 
-        isMatch: incomingFingerprint === storedFingerprint,
-        isShifted: !!isShifted
-      });
+    if (req.body.record && req.body.record.source === "sheets") {
+      logger.info(`Loop Check (Local Echo): rowId=${rowId} match=${incomingFingerprint === storedFingerprint} shifted=${!!isShifted}`);
 
       if (incomingFingerprint === storedFingerprint && !isShifted) {
         logger.info(`Loop Check: rowId=${rowId} match=true. Skipping local echo.`);
@@ -169,9 +165,9 @@ app.post("/supabase-webhook", async (req, res) => {
       if (isShifted) {
         logger.info(`Heal Sync: rowId=${rowId} misalignment detected. Overwriting sheet...`);
         await redis.del(`shifted:${tableName}:${rowId}`);
-      } else {
-        logger.info(`Loop Check: rowId=${rowId} match=false. Proceeding with sync.`);
       }
+    } else {
+      logger.info(`Supabase Source Update: rowId=${rowId} source=${req.body.record ? req.body.record.source : 'unknown'}`);
     }
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
@@ -223,6 +219,9 @@ app.post("/supabase-webhook", async (req, res) => {
           );
           logger.info("Appended new Sheets row", { table: tableName, rowId });
         }
+
+        // CRITICAL: Update the state fingerprint in Redis after successful sync to prevent loop.
+        await redis.set(`lastfingerprint:${tableName}:${rowId}`, incomingFingerprint, "EX", 86400);
       });
     }
 
