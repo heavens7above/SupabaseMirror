@@ -223,9 +223,9 @@ app.post("/sheets-webhook", async (req, res) => {
     );
     const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
     
-    // Explicit alignment log (first 3 columns)
-    const alignment = headers.slice(0, 3).map((h, i) => `${h}:${row[i]}`).join(', ');
-    logger.info(`Sheets Alignment Check: [${alignment}]`, { 
+    // Explicit alignment log (FULL ROW for structural debugging)
+    const alignmentMap = headers.map((h, i) => `${h}:${String(row[i]).substring(0, 15)}`).join(', ');
+    logger.info(`Sheets Structural Alignment: [${alignmentMap}]`, { 
       table, 
       headerCount: headers.length, 
       rowLength: row.length
