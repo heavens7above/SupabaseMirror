@@ -149,6 +149,13 @@ app.post("/supabase-webhook", async (req, res) => {
       throw new Error(`Target sheet '${tableName}' has no headers.`);
     }
 
+    // BURST PROTECTION (Supabase Side): Prevent multiple concurrent updates for the same row
+    const supabaseLockKey = `supabase_processing:${tableName}:${rowId}`;
+    if (!(await redis.set(supabaseLockKey, "true", "EX", 10, "NX"))) {
+      logger.info(`Supabase Burst Protection: Already processing ${tableName}:${rowId}. skipping.`);
+      return res.status(200).send("OK (Burst Protected)");
+    }
+
     // Refined Loop Prevention: Always check fingerprint to prevent echoing our own changes
     const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
     const storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
@@ -176,6 +183,26 @@ app.post("/supabase-webhook", async (req, res) => {
 
         const rowData = syncLogic.mapSupabaseToSheets(record, headers);
         let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`);
+
+        if (rowIndex) {
+          // VERIFY: Check if the row at this index still contains the correct ID
+          const verifyResponse = await pRetry(
+            () =>
+              sheets.spreadsheets.values.get({
+                spreadsheetId: sheetId,
+                range: `${tableName}!${idColLetter}${rowIndex}`,
+              }),
+            { retries: 3 },
+          );
+          
+          const foundId = verifyResponse.data.values ? verifyResponse.data.values[0][0] : null;
+          
+          if (foundId !== rowId) {
+            logger.warn(`Stale rowIndex detected for ${rowId} (found ${foundId} at row ${rowIndex}). Re-scanning...`);
+            rowIndex = null; // Force re-scan
+            await redis.del(`rowindex:${tableName}:${rowId}`);
+          }
+        }
 
         if (!rowIndex) {
           const response = await pRetry(
@@ -229,6 +256,9 @@ app.post("/supabase-webhook", async (req, res) => {
   } catch (error) {
     await logSyncError("supabase", req.body, error);
     res.status(500).send("Internal Server Error");
+  } finally {
+    // Release lock (cleanup is automatic by TTL, but let's be proactive)
+    await redis.del(`supabase_processing:${tableName}:${rowId}`).catch(() => {});
   }
 });
 
