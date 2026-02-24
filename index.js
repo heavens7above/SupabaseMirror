@@ -178,8 +178,15 @@ app.post("/supabase-webhook", async (req, res) => {
     }
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
-        const idColIndex = headers.findIndex(h => h.toLowerCase() === 'id');
-        const idColLetter = getColumnLetter(idColIndex !== -1 ? idColIndex : 0);
+        const idColIndex = headers.findIndex(h => h && h.trim().toLowerCase() === 'id');
+        const actualIdIndex = idColIndex !== -1 ? idColIndex : 0;
+        const idColLetter = getColumnLetter(actualIdIndex);
+
+        logger.info(`Processing Supabase sync for ${tableName}:${rowId}`, {
+          idColIndex: actualIdIndex,
+          idColLetter,
+          headers: headers.slice(0, 10)
+        });
 
         const rowData = syncLogic.mapSupabaseToSheets(record, headers);
         let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`);
@@ -198,7 +205,9 @@ app.post("/supabase-webhook", async (req, res) => {
           const foundId = verifyResponse.data.values ? verifyResponse.data.values[0][0] : null;
           
           if (foundId !== rowId) {
-            logger.warn(`Stale rowIndex detected for ${rowId} (found ${foundId} at row ${rowIndex}). Re-scanning...`);
+            logger.warn(`Stale rowIndex detected for ${rowId} at row ${rowIndex}. Found ID: "${foundId}". Re-scanning column ${idColLetter}...`, {
+              headers: headers.slice(0, 5)
+            });
             rowIndex = null; // Force re-scan
             await redis.del(`rowindex:${tableName}:${rowId}`);
           }
@@ -214,10 +223,12 @@ app.post("/supabase-webhook", async (req, res) => {
             { retries: 3 },
           );
           const rows = response.data.values || [];
-          const index = rows.findIndex((r) => r[0] === rowId);
+          // Use the actual detected column index for re-scan findIndex
+          const index = rows.findIndex((r) => r[actualIdIndex] === rowId);
           if (index !== -1) {
             rowIndex = index + 1;
             await redis.set(`rowindex:${tableName}:${rowId}`, rowIndex);
+            logger.info(`Discovered new rowIndex for ${rowId}: ${rowIndex}`);
           }
         }
 
