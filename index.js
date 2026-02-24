@@ -82,10 +82,19 @@ app.post("/supabase-webhook", async (req, res) => {
     return res.status(200).send("Duplicate");
   }
 
-  // Loop Prevention: If this change originated from Sheets, don't sync it back
+  const { record, old_record, type } = req.body;
+  const rowId = record ? record.id : old_record ? old_record.id : null;
+
+  if (!rowId) return res.status(400).send("No row ID found");
+
+  // Refined Loop Prevention: Skip if the incoming record's synced_at exactly 
+  // matches our current knowledge, meaning the middleware just wrote it.
   if (req.body.record && req.body.record.source === "sheets") {
-    logger.info("Skipping supabase-webhook: Origin is Sheets", { eventId });
-    return res.status(200).send("Skipped loop");
+    const lastSyncedAt = await redis.get(`lastsync:${tableName}:${rowId}`);
+    if (lastSyncedAt === req.body.record.synced_at) {
+      logger.info("Skipping supabase-webhook: Verified middleware origin", { eventId, rowId });
+      return res.status(200).send("Skipped loop");
+    }
   }
 
   const webhookSecret = (process.env.SUPABASE_WEBHOOK_SECRET || "").replace(/^"|"$/g, '');
@@ -100,16 +109,6 @@ app.post("/supabase-webhook", async (req, res) => {
   ) {
     logger.error("Invalid Supabase signature or secret header", { eventId });
     return res.status(401).send("Unauthorized: Invalid Signature or Secret");
-  }
-
-  const { record, old_record, type } = req.body;
-  const rowId = record ? record.id : old_record ? old_record.id : null;
-
-  if (!rowId) return res.status(400).send("No row ID found");
-
-  if (!(await syncLogic.acquireLock(rowId))) {
-    logger.info("Lock active, skipping supabase-webhook", { rowId, eventId });
-    return res.status(200).send("Locked");
   }
 
   try {
@@ -181,8 +180,6 @@ app.post("/supabase-webhook", async (req, res) => {
   } catch (error) {
     await logSyncError("supabase", req.body, error);
     res.status(500).send("Internal Server Error");
-  } finally {
-    await syncLogic.releaseLock(rowId);
   }
 });
 
@@ -195,11 +192,6 @@ app.post("/sheets-webhook", async (req, res) => {
   const sheetsSyncedAt = new Date(timestamp);
 
   logger.info("Received Sheets webhook", { table, rowId, timestamp });
-
-  if (!(await syncLogic.acquireLock(rowId))) {
-    logger.info("Lock active, skipping sheets-webhook", { rowId });
-    return res.status(200).send("Locked");
-  }
 
   try {
     // Fetch headers to perform correct reverse mapping
@@ -249,12 +241,14 @@ app.post("/sheets-webhook", async (req, res) => {
     if (error) throw error;
 
     logger.info("Upserted Supabase record from Sheets", { rowId });
+    
+    // Store the synced_at timestamp to prevent infinite loops in supabase-webhook
+    await redis.set(`lastsync:${table}:${rowId}`, supabaseRecord.synced_at, 'EX', 3600);
+    
     res.status(200).send("OK");
   } catch (error) {
     await logSyncError("sheets", req.body, error);
     res.status(500).send("Internal Server Error");
-  } finally {
-    await syncLogic.releaseLock(rowId);
   }
 });
 
