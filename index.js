@@ -39,10 +39,11 @@ app.get("/health", async (req, res) => {
 
 // Helper: Convert column index to Google Sheets letter (0=A, 1=B, 26=AA)
 function getColumnLetter(index) {
+  let tempIndex = index;
   let letter = "";
-  while (index >= 0) {
-    letter = String.fromCharCode((index % 26) + 65) + letter;
-    index = Math.floor(index / 26) - 1;
+  while (tempIndex >= 0) {
+    letter = String.fromCharCode((tempIndex % 26) + 65) + letter;
+    tempIndex = Math.floor(tempIndex / 26) - 1;
   }
   return letter || "A";
 }
@@ -220,14 +221,27 @@ app.post("/sheets-webhook", async (req, res) => {
       { retries: 3 },
     );
     const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
-    const idIndex = headers.findIndex(h => h.toLowerCase() === 'id');
+    
+    // Diagnostic logging for misalignment issues
+    logger.info("Sheets Sync Diagnostic", { 
+      table, 
+      headerCount: headers.length, 
+      rowLength: row.length,
+      firstHeader: headers[0],
+      firstValue: row[0]
+    });
+
+    const idIndex = headers.findIndex(h => h && h.trim().toLowerCase() === 'id');
     
     if (idIndex === -1) {
+      logger.error(`Missing 'id' column in sheet headers`, { headers });
       throw new Error(`Sheet '${table}' is missing an 'id' column.`);
     }
 
     const rowId = row[idIndex];
-    if (!rowId) return res.status(400).send("No row ID found in the specified column");
+    logger.info(`Detected rowId: ${rowId} at index ${idIndex}`);
+
+    if (!rowId) return res.status(400).send("No row ID found in the detected column");
 
     logger.info("Received Sheets webhook", { table, rowId, timestamp });
 
