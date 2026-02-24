@@ -223,12 +223,12 @@ app.post("/sheets-webhook", async (req, res) => {
     const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
     
     // Diagnostic logging for misalignment issues
-    logger.info("Sheets Sync Diagnostic", { 
+    logger.info("Sheets Sync Diagnostic (Full Details)", { 
       table, 
+      headers: JSON.stringify(headers),
+      row: JSON.stringify(row),
       headerCount: headers.length, 
-      rowLength: row.length,
-      firstHeader: headers[0],
-      firstValue: row[0]
+      rowLength: row.length
     });
 
     const idIndex = headers.findIndex(h => h && h.trim().toLowerCase() === 'id');
@@ -279,6 +279,9 @@ app.post("/sheets-webhook", async (req, res) => {
     const supabaseRecord = syncLogic.mapSheetsToSupabase(row, headers);
     supabaseRecord.source = "sheets"; // Tag origin for loop prevention
     supabaseRecord.synced_at = sheetsSyncedAt.toISOString();
+
+    // CRITICAL: Log the full record to identify which field is a timestamp when it should be a UUID
+    logger.info("Supabase Upsert Payload", { record: supabaseRecord });
 
     const { error } = await pRetry(
       () =>
