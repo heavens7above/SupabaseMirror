@@ -157,7 +157,6 @@ app.post("/supabase-webhook", async (req, res) => {
       if (!localLocks.has(lockKey)) {
         localLocks.add(lockKey);
         lockAcquired = true;
-        setTimeout(() => localLocks.delete(lockKey), 10000); 
       }
     }
 
@@ -238,7 +237,7 @@ app.post("/supabase-webhook", async (req, res) => {
         });
 
         const rowData = syncLogic.mapSupabaseToSheets(record, headers);
-        let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`);
+        let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`).catch(() => null);
 
         if (rowIndex) {
           // VERIFY: Check if the row at this index still contains the correct ID
@@ -258,7 +257,7 @@ app.post("/supabase-webhook", async (req, res) => {
               headers: headers.slice(0, 5)
             });
             rowIndex = null; // Force re-scan
-            await redis.del(`rowindex:${tableName}:${rowId}`);
+            await redis.del(`rowindex:${tableName}:${rowId}`).catch(() => {});
           }
         }
 
@@ -272,12 +271,12 @@ app.post("/supabase-webhook", async (req, res) => {
             { retries: 3 },
           );
           const rows = response.data.values || [];
-          // Use the actual detected column index for re-scan findIndex
-          const index = rows.findIndex((r) => r[actualIdIndex] === rowId);
+          // CRITICAL FIX: The range is a single column, so the ID is always at index 0
+          const index = rows.findIndex((r) => r[0] === rowId);
           if (index !== -1) {
             rowIndex = index + 1;
-            await redis.set(`rowindex:${tableName}:${rowId}`, rowIndex);
-            logger.info(`Discovered new rowIndex for ${rowId}: ${rowIndex}`);
+            await redis.set(`rowindex:${tableName}:${rowId}`, rowIndex).catch(() => {});
+            logger.info(`Discovered existing rowIndex for ${rowId}: ${rowIndex}`);
           }
         }
 
@@ -292,9 +291,9 @@ app.post("/supabase-webhook", async (req, res) => {
               }),
             { retries: 3 },
           );
-          logger.info("Updated Sheets row", { table: tableName, rowId, rowIndex });
+          logger.info(`Updated Sheets row ${rowIndex} for ${rowId}`);
         } else {
-          await pRetry(
+          const appendResponse = await pRetry(
             () =>
               sheets.spreadsheets.values.append({
                 spreadsheetId: sheetId,
@@ -304,22 +303,27 @@ app.post("/supabase-webhook", async (req, res) => {
               }),
             { retries: 3 },
           );
-          logger.info("Appended new Sheets row", { table: tableName, rowId });
-        }
-
-        if (rowIndex) {
-          logger.info("Updated Sheets row", { table: tableName, rowId, rowIndex });
-        } else {
-          logger.info("Appended new Sheets row", { table: tableName, rowId });
+          
+          // Capture new row index from append response
+          const updatedRange = appendResponse.data.updates.updatedRange; // e.g. "menu_items!A15:F15"
+          const match = updatedRange.match(/!A(\d+):/);
+          if (match) {
+            rowIndex = match[1];
+            await redis.set(`rowindex:${tableName}:${rowId}`, rowIndex).catch(() => {});
+          }
+          logger.info("Appended new Sheets row", { table: tableName, rowId, rowIndex });
         }
 
         // CRITICAL: Update the state fingerprint in Redis after successful sync (with fallback)
         await redis.set(`lastfingerprint:${tableName}:${rowId}`, incomingFingerprint, "EX", 86400).catch(() => {});
         localFingerprints.set(`${tableName}:${rowId}`, incomingFingerprint);
       }).finally(() => {
-        // Release locks
+        // Release locks ONLY after queue task is done
         localLocks.delete(`${tableName}:${rowId}`);
       });
+    } else {
+      // Release lock for non-sync events
+      localLocks.delete(`${tableName}:${rowId}`);
     }
 
     res.status(200).send("OK");
@@ -363,9 +367,20 @@ app.post("/sheets-webhook", async (req, res) => {
     if (!rowId) return res.status(400).send("No row ID found in the detected column");
 
     // BURST PROTECTION: Stop Sheet firehose (multiple onEdit events for one change)
-    const lockKey = `sheets_processing:${table}:${rowId}`;
-    const acquired = await redis.set(lockKey, 'true', 'EX', 5, 'NX');
-    if (!acquired) {
+    // Hybrid: try Redis lock, fall back to local memory if Redis is down
+    const lockKey = `${table}:${rowId}`;
+    let sheetsLockAcquired = false;
+    try {
+      sheetsLockAcquired = await redis.set(`sheets_processing:${lockKey}`, 'true', 'EX', 5, 'NX');
+    } catch (e) {
+      logger.warn(`Redis sheets lock failed, falling back to local memory for ${lockKey}`);
+      if (!localLocks.has(`sheets:${lockKey}`)) {
+        localLocks.add(`sheets:${lockKey}`);
+        sheetsLockAcquired = true;
+        setTimeout(() => localLocks.delete(`sheets:${lockKey}`), 5000);
+      }
+    }
+    if (!sheetsLockAcquired) {
       logger.info(`Sheets Burst Protection: Already processing ${table}:${rowId}. skipping.`);
       return res.status(200).send("OK (Burst Protected)");
     }
@@ -382,12 +397,12 @@ app.post("/sheets-webhook", async (req, res) => {
         const diagMap = headers.slice(0, 10).map((h, i) => `${h || 'COL'+i}: ${String(row[i]).substring(0, 15)}`).join(' | ');
         logger.info(`[DIAGNOSTIC] Structural Shift Detected on ${table}:${rowId}: ${diagMap}`);
         // Flag for "Structural Healing" - forces a sync back even if fingerprints match
-        await redis.set(`shifted:${table}:${rowId}`, 'true', 'EX', 60);
+        await redis.set(`shifted:${table}:${rowId}`, 'true', 'EX', 60).catch(() => {});
       }
 
       // FK VALIDATION: Check if category_id exists (if present)
       if (incomingRecord.category_id) {
-        const isValid = await redis.sismember('valid_categories', incomingRecord.category_id);
+        const isValid = await redis.sismember('valid_categories', incomingRecord.category_id).catch(() => 1);
         if (!isValid) {
           logger.warn(`Discarding invalid category_id: ${incomingRecord.category_id} (Not found in Supabase)`);
           incomingRecord.category_id = null;
@@ -395,9 +410,11 @@ app.post("/sheets-webhook", async (req, res) => {
       }
 
       const incomingFingerprint = syncLogic.calculateFingerprint(incomingRecord, headers);
-      const lastFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
+      const lastFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`).catch(() => null);
+      const localFingerprint = localFingerprints.get(`${table}:${rowId}`);
+      const effectiveLastFingerprint = lastFingerprint || localFingerprint;
 
-      if (incomingFingerprint === lastFingerprint) {
+      if (incomingFingerprint === effectiveLastFingerprint) {
         logger.info(`Dropping duplicate/local-echo Sheets update for ${rowId}`);
         return res.status(200).send("Dropped (Duplicate)");
       }
