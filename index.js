@@ -140,9 +140,10 @@ app.post("/supabase-webhook", async (req, res) => {
       });
 
       if (incomingFingerprint === lastFingerprint) {
-        logger.info(`Skipping supabase-webhook: Exact content echo detected for ${rowId}`);
+        logger.info(`Loop Check: rowId=${rowId} match=true. Skipping local echo.`);
         return res.status(200).send("Skipped loop");
       }
+      logger.info(`Loop Check: rowId=${rowId} match=false. Proceeding with sync.`);
     }
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
@@ -222,8 +223,9 @@ app.post("/sheets-webhook", async (req, res) => {
     );
     const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
     
-    // Diagnostic logging for misalignment issues
-    logger.info("Sheets Sync Processing", { 
+    // Explicit alignment log (first 3 columns)
+    const alignment = headers.slice(0, 3).map((h, i) => `${h}:${row[i]}`).join(', ');
+    logger.info(`Sheets Alignment Check: [${alignment}]`, { 
       table, 
       headerCount: headers.length, 
       rowLength: row.length
@@ -237,10 +239,9 @@ app.post("/sheets-webhook", async (req, res) => {
     }
 
     const rowId = row[idIndex];
-
     if (!rowId) return res.status(400).send("No row ID found in the detected column");
 
-    logger.info("Received Sheets webhook", { table, rowId, timestamp });
+    logger.info(`Processing Sheets Update: table=${table} rowId=${rowId}`);
 
     const { data: currentRecord } = await pRetry(
       () =>
@@ -274,6 +275,12 @@ app.post("/sheets-webhook", async (req, res) => {
     }
 
     const supabaseRecord = syncLogic.mapSheetsToSupabase(row, headers);
+    
+    // STRICTLY REMOVE metadata fields before upsert to prevent type errors (like UUID vs Timestamp)
+    // and to let Supabase manage its own internal fields.
+    const fieldsToExclude = ['created_at', 'updated_at', 'synced_at', 'source'];
+    fieldsToExclude.forEach(field => delete supabaseRecord[field]);
+
     supabaseRecord.source = "sheets"; // Tag origin for loop prevention
     supabaseRecord.synced_at = sheetsSyncedAt.toISOString();
 
