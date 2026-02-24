@@ -12,6 +12,14 @@ const { default: PQueue } = require("p-queue");
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Local Header Cache (TTL: 1 minute)
+const headerCache = new Map();
+const HEADER_CACHE_TTL = 60000;
+
+// Local Memory Fallback for Concurrency and Loops
+const localLocks = new Set();
+const localFingerprints = new Map();
+
 // Security Middleware
 app.use(helmet());
 
@@ -99,6 +107,8 @@ app.post("/supabase-webhook", async (req, res) => {
   const signature = req.headers["x-supabase-signature"];
   const tableName = req.body.table;
 
+  logger.info(`Webhook content received: ${tableName}`);
+
   logger.info("Received Supabase webhook", {
     eventId,
     table: tableName,
@@ -135,31 +145,68 @@ app.post("/supabase-webhook", async (req, res) => {
   }
 
   try {
-    // Fetch headers upfront to use for fingerprinting AND mapping
-    const headerResponse = await pRetry(
-      () =>
-        sheets.spreadsheets.values.get({
-          spreadsheetId: sheetId,
-          range: `${tableName}!1:1`,
-        }),
-      { retries: 3 },
-    );
-    const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
-    if (headers.length === 0) {
-      throw new Error(`Target sheet '${tableName}' has no headers.`);
+    const lockKey = `${tableName}:${rowId}`;
+    
+    // BURST PROTECTION: Try Redis first, fallback to local memory
+    let lockAcquired = false;
+    try {
+      const redisLockKey = `supabase_processing:${lockKey}`;
+      lockAcquired = await redis.set(redisLockKey, "true", "EX", 10, "NX");
+    } catch (e) {
+      logger.warn(`Redis lock failed, falling back to local memory for ${lockKey}`);
+      if (!localLocks.has(lockKey)) {
+        localLocks.add(lockKey);
+        lockAcquired = true;
+        setTimeout(() => localLocks.delete(lockKey), 10000); 
+      }
     }
 
-    // BURST PROTECTION (Supabase Side): Prevent multiple concurrent updates for the same row
-    const supabaseLockKey = `supabase_processing:${tableName}:${rowId}`;
-    if (!(await redis.set(supabaseLockKey, "true", "EX", 10, "NX"))) {
-      logger.info(`Supabase Burst Protection: Already processing ${tableName}:${rowId}. skipping.`);
+    if (!lockAcquired) {
+      logger.info(`Burst Protection: Already processing ${lockKey}. skipping.`);
       return res.status(200).send("OK (Burst Protected)");
     }
 
-    // Refined Loop Prevention: Always check fingerprint to prevent echoing our own changes
+    // Step 1: Get Headers (with local caching)
+    let headers = null;
+    const cached = headerCache.get(tableName);
+    if (cached && Date.now() - cached.timestamp < HEADER_CACHE_TTL) {
+      headers = cached.headers;
+    } else {
+      logger.info(`[Step 1] Fetching fresh headers for ${tableName}`);
+      const headerResponse = await pRetry(
+        () =>
+          sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: `${tableName}!1:1`,
+          }),
+        { retries: 3 },
+      );
+      headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+      if (headers.length > 0) {
+        headerCache.set(tableName, { headers, timestamp: Date.now() });
+      }
+    }
+
+    if (!headers || headers.length === 0) {
+      throw new Error(`Target sheet '${tableName}' has no headers.`);
+    }
+
+    logger.info(`[Step 2] Calculating fingerprint for ${rowId}`);
     const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
-    const storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
-    const isShifted = await redis.get(`shifted:${tableName}:${rowId}`);
+    
+    let storedFingerprint = null;
+    try {
+      storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
+    } catch (e) {
+      logger.warn(`Redis fingerprint lookup failed, falling back to local for ${lockKey}`);
+    }
+    
+    // Explicitly check local map if Redis returned null or failed
+    if (!storedFingerprint) {
+      storedFingerprint = localFingerprints.get(lockKey);
+    }
+    
+    const isShifted = await redis.get(`shifted:${tableName}:${rowId}`).catch(() => null);
 
     if (req.body.record && req.body.record.source === "sheets") {
       logger.info(`Loop Check (Local Echo): rowId=${rowId} match=${incomingFingerprint === storedFingerprint} shifted=${!!isShifted}`);
@@ -177,7 +224,9 @@ app.post("/supabase-webhook", async (req, res) => {
       logger.info(`Supabase Source Update: rowId=${rowId} source=${req.body.record ? req.body.record.source : 'unknown'}`);
     }
     if (type === "INSERT" || type === "UPDATE") {
+      logger.info(`[Step 3] Adding to sheetsQueue for ${rowId}`);
       await sheetsQueue.add(async () => {
+        logger.info(`[Step 4] Queue started for ${rowId}`);
         const idColIndex = headers.findIndex(h => h && h.trim().toLowerCase() === 'id');
         const actualIdIndex = idColIndex !== -1 ? idColIndex : 0;
         const idColLetter = getColumnLetter(actualIdIndex);
@@ -258,8 +307,18 @@ app.post("/supabase-webhook", async (req, res) => {
           logger.info("Appended new Sheets row", { table: tableName, rowId });
         }
 
-        // CRITICAL: Update the state fingerprint in Redis after successful sync to prevent loop.
-        await redis.set(`lastfingerprint:${tableName}:${rowId}`, incomingFingerprint, "EX", 86400);
+        if (rowIndex) {
+          logger.info("Updated Sheets row", { table: tableName, rowId, rowIndex });
+        } else {
+          logger.info("Appended new Sheets row", { table: tableName, rowId });
+        }
+
+        // CRITICAL: Update the state fingerprint in Redis after successful sync (with fallback)
+        await redis.set(`lastfingerprint:${tableName}:${rowId}`, incomingFingerprint, "EX", 86400).catch(() => {});
+        localFingerprints.set(`${tableName}:${rowId}`, incomingFingerprint);
+      }).finally(() => {
+        // Release locks
+        localLocks.delete(`${tableName}:${rowId}`);
       });
     }
 

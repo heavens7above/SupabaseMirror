@@ -23,6 +23,7 @@
   "type": "commonjs",
   "dependencies": {
     "@supabase/supabase-js": "^2.97.0",
+    "axios": "^1.13.5",
     "body-parser": "^2.2.2",
     "crypto": "^1.0.1",
     "dotenv": "^17.3.1",
