@@ -37,6 +37,16 @@ app.get("/health", async (req, res) => {
   }
 });
 
+// Helper: Convert column index to Google Sheets letter (0=A, 1=B, 26=AA)
+function getColumnLetter(index) {
+  let letter = "";
+  while (index >= 0) {
+    letter = String.fromCharCode((index % 26) + 65) + letter;
+    index = Math.floor(index / 26) - 1;
+  }
+  return letter || "A";
+}
+
 // Helper: Log Sync Error to Supabase (DLQ)
 async function logSyncError(source, payload, error) {
   // CRITICAL: Log full error to console for Railway debugging
@@ -135,6 +145,9 @@ app.post("/supabase-webhook", async (req, res) => {
     }
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
+        const idColIndex = headers.findIndex(h => h.toLowerCase() === 'id');
+        const idColLetter = getColumnLetter(idColIndex !== -1 ? idColIndex : 0);
+
         const rowData = syncLogic.mapSupabaseToSheets(record, headers);
         let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`);
 
@@ -143,7 +156,7 @@ app.post("/supabase-webhook", async (req, res) => {
             () =>
               sheets.spreadsheets.values.get({
                 spreadsheetId: sheetId,
-                range: `${tableName}!A:A`,
+                range: `${tableName}!${idColLetter}:${idColLetter}`,
               }),
             { retries: 3 },
           );
@@ -193,15 +206,11 @@ app.post("/supabase-webhook", async (req, res) => {
 // Google Sheets Webhook Endpoint
 app.post("/sheets-webhook", async (req, res) => {
   const { row, timestamp, table } = req.body;
-  if (!row || !row[0] || !table) return res.status(400).send("Invalid row data or missing table name");
-
-  const rowId = row[0];
+  if (!row || !table) return res.status(400).send("Invalid row data or missing table name");
   const sheetsSyncedAt = new Date(timestamp);
 
-  logger.info("Received Sheets webhook", { table, rowId, timestamp });
-
   try {
-    // Fetch headers to perform correct reverse mapping
+    // Fetch headers first to find the ID column dynamically
     const headerResponse = await pRetry(
       () =>
         sheets.spreadsheets.values.get({
@@ -211,6 +220,16 @@ app.post("/sheets-webhook", async (req, res) => {
       { retries: 3 },
     );
     const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+    const idIndex = headers.findIndex(h => h.toLowerCase() === 'id');
+    
+    if (idIndex === -1) {
+      throw new Error(`Sheet '${table}' is missing an 'id' column.`);
+    }
+
+    const rowId = row[idIndex];
+    if (!rowId) return res.status(400).send("No row ID found in the specified column");
+
+    logger.info("Received Sheets webhook", { table, rowId, timestamp });
 
     const { data: currentRecord } = await pRetry(
       () =>
