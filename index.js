@@ -87,12 +87,19 @@ app.post("/supabase-webhook", async (req, res) => {
 
   if (!rowId) return res.status(400).send("No row ID found");
 
-  // Refined Loop Prevention: Skip if the incoming record's synced_at exactly 
-  // matches our current knowledge, meaning the middleware just wrote it.
+  // Refined Loop Prevention: Skip if the incoming record's content exactly 
+  // matches what we just wrote, meaning it's a loop echo.
   if (req.body.record && req.body.record.source === "sheets") {
-    const lastSyncedAt = await redis.get(`lastsync:${tableName}:${rowId}`);
-    if (lastSyncedAt === req.body.record.synced_at) {
-      logger.info("Skipping supabase-webhook: Verified middleware origin", { eventId, rowId });
+    const incomingFingerprint = syncLogic.calculateFingerprint(record);
+    const lastFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
+
+    logger.info("Loop Check (Fingerprint)", { 
+      rowId, 
+      isMatch: incomingFingerprint === lastFingerprint
+    });
+
+    if (incomingFingerprint === lastFingerprint) {
+      logger.info("Skipping supabase-webhook: Exact content echo detected", { eventId, rowId });
       return res.status(200).send("Skipped loop");
     }
   }
@@ -242,8 +249,9 @@ app.post("/sheets-webhook", async (req, res) => {
 
     logger.info("Upserted Supabase record from Sheets", { rowId });
     
-    // Store the synced_at timestamp to prevent infinite loops in supabase-webhook
-    await redis.set(`lastsync:${table}:${rowId}`, supabaseRecord.synced_at, 'EX', 3600);
+    // Store fingerprint to prevent infinite loops (only if content is identical)
+    const fingerprint = syncLogic.calculateFingerprint(supabaseRecord);
+    await redis.set(`lastfingerprint:${table}:${rowId}`, fingerprint, 'EX', 3600);
     
     res.status(200).send("OK");
   } catch (error) {
