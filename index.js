@@ -8,6 +8,8 @@ const redis = require("./lib/redis-client");
 const syncLogic = require("./lib/sync-logic");
 const logger = require("./lib/logger");
 const { default: PQueue } = require("p-queue");
+const { createWebhookMiddleware } = require("./lib/webhook-middleware");
+const { registry } = require("./lib/webhook-dispatcher");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -102,7 +104,7 @@ async function logSyncError(source, payload, error) {
 }
 
 // Supabase Webhook Endpoint
-app.post("/supabase-webhook", async (req, res) => {
+const supabaseHandler = async (req, res) => {
   const eventId = req.headers["x-supabase-event-id"];
   const signature = req.headers["x-supabase-signature"];
   const tableName = req.body.table;
@@ -335,10 +337,13 @@ app.post("/supabase-webhook", async (req, res) => {
     // Release lock (cleanup is automatic by TTL, but let's be proactive)
     await redis.del(`supabase_processing:${tableName}:${rowId}`).catch(() => {});
   }
-});
+};
+
+registry.register('supabase', supabaseHandler);
+app.post("/supabase-webhook", createWebhookMiddleware('supabase'), registry.dispatch('supabase'));
 
 // Google Sheets Webhook Endpoint
-app.post("/sheets-webhook", async (req, res) => {
+const sheetsHandler = async (req, res) => {
   const { row, timestamp, table } = req.body;
   if (!row || !table) return res.status(400).send("Invalid row data or missing table name");
   const sheetsSyncedAt = new Date(timestamp);
@@ -483,7 +488,10 @@ app.post("/sheets-webhook", async (req, res) => {
     await logSyncError("sheets", req.body, error);
     res.status(500).send("Internal Server Error");
   }
-});
+};
+
+registry.register('sheets', sheetsHandler);
+app.post("/sheets-webhook", createWebhookMiddleware('sheets'), registry.dispatch('sheets'));
 
 const server = app.listen(port, () => {
   logger.info(`Middleware server listening on port ${port}`, {
