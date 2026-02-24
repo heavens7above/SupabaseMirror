@@ -151,6 +151,7 @@ app.post("/supabase-webhook", async (req, res) => {
 
     // Refined Loop Prevention: Only fingerprint keys that exist in the SHEET
     if (req.body.record && req.body.record.source === "sheets") {
+      const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
       const storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
       const isShifted = await redis.get(`shifted:${tableName}:${rowId}`);
 
