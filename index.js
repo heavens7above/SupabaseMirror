@@ -151,21 +151,26 @@ app.post("/supabase-webhook", async (req, res) => {
 
     // Refined Loop Prevention: Only fingerprint keys that exist in the SHEET
     if (req.body.record && req.body.record.source === "sheets") {
-      const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
-      const lastFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
+      const storedFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
+      const isShifted = await redis.get(`shifted:${tableName}:${rowId}`);
 
-      logger.info(`Loop Check: rowId=${rowId} match=${incomingFingerprint === lastFingerprint}`, { 
+      logger.info(`Loop Check: rowId=${rowId} match=${incomingFingerprint === storedFingerprint} shifted=${!!isShifted}`, { 
         rowId, 
-        isMatch: incomingFingerprint === lastFingerprint,
-        incoming: incomingFingerprint,
-        stored: lastFingerprint
+        isMatch: incomingFingerprint === storedFingerprint,
+        isShifted: !!isShifted
       });
 
-      if (incomingFingerprint === lastFingerprint) {
+      if (incomingFingerprint === storedFingerprint && !isShifted) {
         logger.info(`Loop Check: rowId=${rowId} match=true. Skipping local echo.`);
         return res.status(200).send("Skipped loop");
       }
-      logger.info(`Loop Check: rowId=${rowId} match=false. Proceeding with sync.`);
+      
+      if (isShifted) {
+        logger.info(`Heal Sync: rowId=${rowId} misalignment detected. Overwriting sheet...`);
+        await redis.del(`shifted:${tableName}:${rowId}`);
+      } else {
+        logger.info(`Loop Check: rowId=${rowId} match=false. Proceeding with sync.`);
+      }
     }
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
@@ -275,7 +280,9 @@ app.post("/sheets-webhook", async (req, res) => {
       const isMisaligned = row.some((v, i) => v && headers[i] && headers[i].toLowerCase().includes('id') && !syncLogic.UUID_REGEX.test(v));
       if (isMisaligned) {
         const diagMap = headers.slice(0, 10).map((h, i) => `${h || 'COL'+i}: ${String(row[i]).substring(0, 15)}`).join(' | ');
-        logger.info(`[DIAGNOSTIC] Structural Shift Detected: ${diagMap}`);
+        logger.info(`[DIAGNOSTIC] Structural Shift Detected on ${table}:${rowId}: ${diagMap}`);
+        // Flag for "Structural Healing" - forces a sync back even if fingerprints match
+        await redis.set(`shifted:${table}:${rowId}`, 'true', 'EX', 60);
       }
 
       // FK VALIDATION: Check if category_id exists (if present)
