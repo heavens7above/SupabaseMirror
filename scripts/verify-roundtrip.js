@@ -12,8 +12,8 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const { default: pRetry } = require('p-retry');
-const supabase = require('./lib/supabase-client');
-require('dotenv').config();
+const supabase = require('../lib/supabase-client');
+require('dotenv').config({ path: '../.env' });
 
 const BASE_URL = process.env.MIDDLEWARE_URL || 'http://localhost:3000';
 const WEBHOOK_SECRET = (process.env.SUPABASE_WEBHOOK_SECRET || '').replace(/^"|"$/g, '');

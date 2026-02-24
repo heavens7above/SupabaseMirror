@@ -265,6 +265,7 @@ const supabaseHandler = async (req, res) => {
         }
 
         if (!rowIndex) {
+          const idColLetter = getColumnLetter(actualIdIndex);
           const response = await pRetry(
             () =>
               sheets.spreadsheets.values.get({
@@ -274,10 +275,11 @@ const supabaseHandler = async (req, res) => {
             { retries: 3 },
           );
           const rows = response.data.values || [];
+          
           // CRITICAL FIX: The range is a single column, so the ID is always at index 0
-          const index = rows.findIndex((r) => r[0] === rowId);
+          const index = rows.findIndex((r) => r[0] && r[0].trim() === rowId.trim());
           if (index !== -1) {
-            rowIndex = index + 1;
+            rowIndex = index + 1; // 1-indexed for sheets
             await redis.set(`rowindex:${tableName}:${rowId}`, rowIndex).catch(() => {});
             logger.info(`Discovered existing rowIndex for ${rowId}: ${rowIndex}`);
           }
