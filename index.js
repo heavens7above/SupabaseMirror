@@ -223,16 +223,10 @@ app.post("/sheets-webhook", async (req, res) => {
     );
     const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
     
-    // Explicit alignment log (FULL ROW for structural debugging)
-    const alignmentMap = headers.map((h, i) => `${h}:${String(row[i]).substring(0, 15)}`).join(', ');
-    logger.info(`Sheets Structural Alignment: [${alignmentMap}]`, { 
-      table, 
-      headerCount: headers.length, 
-      rowLength: row.length
-    });
+    // Structural Alignment log (only if data changed or for the first request in a burst)
+    // We already log "Processing Sheets Update" below.
 
     const idIndex = headers.findIndex(h => h && h.trim().toLowerCase() === 'id');
-    
     if (idIndex === -1) {
       logger.error(`Missing 'id' column in sheet headers`, { headers });
       throw new Error(`Sheet '${table}' is missing an 'id' column.`);
@@ -243,6 +237,19 @@ app.post("/sheets-webhook", async (req, res) => {
 
     logger.info(`Processing Sheets Update: table=${table} rowId=${rowId}`);
 
+    // PRE-UPSERT DEDUPLICATION:
+    // Map the incoming data and check if it matches the last state we processed.
+    const incomingRecord = syncLogic.mapSheetsToSupabase(row, headers);
+    const incomingFingerprint = syncLogic.calculateFingerprint(incomingRecord, headers);
+    const lastFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
+
+    if (incomingFingerprint === lastFingerprint) {
+      logger.info(`Dropping duplicate/local-echo Sheets update for ${rowId}`);
+      return res.status(200).send("Dropped (Duplicate)");
+    }
+
+    // CONFLICT RESOLUTION:
+    // If Supabase is newer, check if we're actually changing anything.
     const { data: currentRecord } = await pRetry(
       () =>
         supabase
@@ -256,28 +263,16 @@ app.post("/sheets-webhook", async (req, res) => {
     if (currentRecord && currentRecord.synced_at) {
       const supabaseSyncedAt = new Date(currentRecord.synced_at);
       if (supabaseSyncedAt > sheetsSyncedAt) {
-        // Check if content is actually different before calling it a conflict
-        const supabaseRecordFromSheets = syncLogic.mapSheetsToSupabase(row, headers);
-        const incomingFingerprint = syncLogic.calculateFingerprint(supabaseRecordFromSheets, headers);
-        const currentFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
-
-        if (incomingFingerprint === currentFingerprint) {
-          logger.info(`Dropping stale but identical Sheets update for ${rowId}`);
-          return res.status(200).send("Dropped (Identical)");
-        }
-
         logger.info(
-          `Conflict Detected! Supabase record is newer for ${rowId}`,
+          `Conflict Detected! Supabase record is newer for ${rowId}. Dropping.`,
           { rowId },
         );
         return res.status(200).send("Dropped due to conflict");
       }
     }
 
-    const supabaseRecord = syncLogic.mapSheetsToSupabase(row, headers);
-    
-    // STRICTLY REMOVE metadata fields before upsert to prevent type errors (like UUID vs Timestamp)
-    // and to let Supabase manage its own internal fields.
+    // Prepare final payload for Supabase
+    const supabaseRecord = { ...incomingRecord };
     const fieldsToExclude = ['created_at', 'updated_at', 'synced_at', 'source'];
     fieldsToExclude.forEach(field => delete supabaseRecord[field]);
 
@@ -296,9 +291,8 @@ app.post("/sheets-webhook", async (req, res) => {
 
     logger.info("Upserted Supabase record from Sheets", { rowId });
     
-    // Store fingerprint to prevent infinite loops (using ONLY headers for stability)
-    const fingerprint = syncLogic.calculateFingerprint(supabaseRecord, headers);
-    await redis.set(`lastfingerprint:${table}:${rowId}`, fingerprint, 'EX', 3600);
+    // Store fingerprint to prevent infinite loops (using incoming fingerprint for stability)
+    await redis.set(`lastfingerprint:${table}:${rowId}`, incomingFingerprint, 'EX', 3600);
     
     res.status(200).send("OK");
   } catch (error) {
