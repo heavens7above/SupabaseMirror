@@ -20,7 +20,7 @@ const WEBHOOK_SECRET = (process.env.SUPABASE_WEBHOOK_SECRET || '').replace(/^"|"
 
 const TABLE   = 'menu_items';
 const ROW_ID  = '10c4021e-9404-437c-85ac-8440baf8595c';  // Pre-existing test row
-const CAT_ID  = '61401201-6a49-4928-8984-e13cbfe8ae34';
+const CAT_ID  = 'd9db1969-e8ea-407b-9ac7-dad299f34cb7';  // Must be valid in DB
 // Sheet column order must match the real Google Sheet exactly
 const HEADERS = ["id","category_id","name","description","price","image_url","is_available","is_veg","created_at","updated_at","deleted_at","synced_at","source"];
 
