@@ -30,12 +30,34 @@ app.use(
 app.get("/health", async (req, res) => {
   try {
     await redis.ping();
-    res.status(200).json({ status: "ok", redis: "connected" });
+    const catCount = await redis.scard('valid_categories');
+    res.status(200).json({ status: "ok", redis: "connected", categories_cached: catCount });
   } catch (error) {
     logger.error("Health check failed", { error: error.message });
     res.status(503).json({ status: "error", redis: "disconnected" });
   }
 });
+
+/**
+ * Periodically syncs valid category IDs from Supabase to Redis for fast validation.
+ */
+async function syncCategories() {
+  try {
+    const { data: categories } = await supabase.from('menu_categories').select('id');
+    if (categories && categories.length > 0) {
+      const ids = categories.map(c => c.id);
+      await redis.del('valid_categories');
+      await redis.sadd('valid_categories', ...ids);
+      logger.info(`Synced ${ids.length} valid category IDs to cache.`);
+    }
+  } catch (error) {
+    logger.error("Failed to sync categories to cache", { error: error.message });
+  }
+}
+
+// Initial sync and every 5 minutes
+syncCategories();
+setInterval(syncCategories, 300000);
 
 // Helper: Convert column index to Google Sheets letter (0=A, 1=B, 26=AA)
 function getColumnLetter(index) {
@@ -248,6 +270,23 @@ app.post("/sheets-webhook", async (req, res) => {
 
       // PRE-UPSERT DEDUPLICATION:
       const incomingRecord = syncLogic.mapSheetsToSupabase(row, headers);
+      
+      // STRUCTURAL DIAGNOSTIC: Log full alignment if misalignment is detected
+      const isMisaligned = row.some((v, i) => v && headers[i] && headers[i].toLowerCase().includes('id') && !syncLogic.UUID_REGEX.test(v));
+      if (isMisaligned) {
+        const diagMap = headers.slice(0, 10).map((h, i) => `${h || 'COL'+i}: ${String(row[i]).substring(0, 15)}`).join(' | ');
+        logger.info(`[DIAGNOSTIC] Structural Shift Detected: ${diagMap}`);
+      }
+
+      // FK VALIDATION: Check if category_id exists (if present)
+      if (incomingRecord.category_id) {
+        const isValid = await redis.sismember('valid_categories', incomingRecord.category_id);
+        if (!isValid) {
+          logger.warn(`Discarding invalid category_id: ${incomingRecord.category_id} (Not found in Supabase)`);
+          incomingRecord.category_id = null;
+        }
+      }
+
       const incomingFingerprint = syncLogic.calculateFingerprint(incomingRecord, headers);
       const lastFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
 
