@@ -31,33 +31,40 @@ async function backfill() {
 
     console.log(`Fetched ${allRecords.length} records from Supabase.`);
 
-    // 2. Clear Sheet (optional/be careful) and write in batches
-    // Assuming headers are already there
+    // 2. Fetch headers from the target sheet
+    const headerResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range: `${tableName}!1:1`,
+    });
+    const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+    if (headers.length === 0) throw new Error(`Sheet '${tableName}' has no headers.`);
+
+    // 3. Clear Sheet (keep headers) and write in batches
+    console.log(`Clearing existing data from Google Sheet...`);
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: sheetId,
+      range: `${tableName}!A2:ZZ`,
+    });
+    
+    console.log(`Writing batches to Google Sheet...`);
     const batchSize = 500;
+    let currentRow = 2; // start after header
+    
     for (let i = 0; i < allRecords.length; i += batchSize) {
       const batch = allRecords.slice(i, i + batchSize);
-      // Fetch headers from the target sheet
-      const headerResponse = await sheets.spreadsheets.values.get({
-        spreadsheetId: sheetId,
-        range: `${tableName}!1:1`,
-      });
-      const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
-      if (headers.length === 0) throw new Error(`Sheet '${tableName}' has no headers.`);
-
       const values = batch.map(record => syncLogic.mapSupabaseToSheets(record, headers));
       
-      await sheets.spreadsheets.values.append({
+      const endRowText = currentRow + values.length - 1;
+      await sheets.spreadsheets.values.update({
         spreadsheetId: sheetId,
-        range: `${tableName}!1:1`,
+        range: `${tableName}!A${currentRow}:Z${endRowText}`,
         valueInputOption: 'USER_ENTERED',
         resource: { values },
       });
 
-      // 3. Populate Redis cache (id -> rowIndex)
-      // Note: append doesn't return exact row indexes for each item easily.
-      // A full read after append might be needed to get accurate row indexes if the sheet wasn't empty.
+      console.log(`Processed batch ${Math.floor(i / batchSize) + 1} (Rows ${currentRow}-${endRowText})`);
+      currentRow += values.length;
       
-      console.log(`Processed batch ${Math.floor(i / batchSize) + 1}`);
       // Sleep to respect rate limits if needed
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
