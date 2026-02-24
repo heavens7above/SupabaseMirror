@@ -87,23 +87,6 @@ app.post("/supabase-webhook", async (req, res) => {
 
   if (!rowId) return res.status(400).send("No row ID found");
 
-  // Refined Loop Prevention: Skip if the incoming record's content exactly 
-  // matches what we just wrote, meaning it's a loop echo.
-  if (req.body.record && req.body.record.source === "sheets") {
-    const incomingFingerprint = syncLogic.calculateFingerprint(record);
-    const lastFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
-
-    logger.info("Loop Check (Fingerprint)", { 
-      rowId, 
-      isMatch: incomingFingerprint === lastFingerprint
-    });
-
-    if (incomingFingerprint === lastFingerprint) {
-      logger.info("Skipping supabase-webhook: Exact content echo detected", { eventId, rowId });
-      return res.status(200).send("Skipped loop");
-    }
-  }
-
   const webhookSecret = (process.env.SUPABASE_WEBHOOK_SECRET || "").replace(/^"|"$/g, '');
 
   if (
@@ -119,22 +102,37 @@ app.post("/supabase-webhook", async (req, res) => {
   }
 
   try {
+    // Fetch headers upfront to use for fingerprinting AND mapping
+    const headerResponse = await pRetry(
+      () =>
+        sheets.spreadsheets.values.get({
+          spreadsheetId: sheetId,
+          range: `${tableName}!1:1`,
+        }),
+      { retries: 3 },
+    );
+    const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
+    if (headers.length === 0) {
+      throw new Error(`Target sheet '${tableName}' has no headers.`);
+    }
+
+    // Refined Loop Prevention: Only fingerprint keys that exist in the SHEET
+    if (req.body.record && req.body.record.source === "sheets") {
+      const incomingFingerprint = syncLogic.calculateFingerprint(record, headers);
+      const lastFingerprint = await redis.get(`lastfingerprint:${tableName}:${rowId}`);
+
+      logger.info("Loop Check (Fingerprint)", { 
+        rowId, 
+        isMatch: incomingFingerprint === lastFingerprint
+      });
+
+      if (incomingFingerprint === lastFingerprint) {
+        logger.info("Skipping supabase-webhook: Exact content echo detected", { eventId, rowId });
+        return res.status(200).send("Skipped loop");
+      }
+    }
     if (type === "INSERT" || type === "UPDATE") {
       await sheetsQueue.add(async () => {
-        // Fetch headers from the sheet to ensure correct column mapping
-        const headerResponse = await pRetry(
-          () =>
-            sheets.spreadsheets.values.get({
-              spreadsheetId: sheetId,
-              range: `${tableName}!1:1`,
-            }),
-          { retries: 3 },
-        );
-        const headers = headerResponse.data.values ? headerResponse.data.values[0] : [];
-        if (headers.length === 0) {
-          throw new Error(`Target sheet '${tableName}' has no headers.`);
-        }
-
         const rowData = syncLogic.mapSupabaseToSheets(record, headers);
         let rowIndex = await redis.get(`rowindex:${tableName}:${rowId}`);
 
@@ -225,6 +223,16 @@ app.post("/sheets-webhook", async (req, res) => {
     if (currentRecord && currentRecord.synced_at) {
       const supabaseSyncedAt = new Date(currentRecord.synced_at);
       if (supabaseSyncedAt > sheetsSyncedAt) {
+        // Check if content is actually different before calling it a conflict
+        const supabaseRecordFromSheets = syncLogic.mapSheetsToSupabase(row, headers);
+        const incomingFingerprint = syncLogic.calculateFingerprint(supabaseRecordFromSheets, headers);
+        const currentFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
+
+        if (incomingFingerprint === currentFingerprint) {
+          logger.info("Dropping stale but identical Sheets update", { rowId });
+          return res.status(200).send("Dropped (Identical)");
+        }
+
         logger.info(
           "Conflict: Supabase record is newer. Dropping Sheets update.",
           { rowId },
@@ -249,8 +257,8 @@ app.post("/sheets-webhook", async (req, res) => {
 
     logger.info("Upserted Supabase record from Sheets", { rowId });
     
-    // Store fingerprint to prevent infinite loops (only if content is identical)
-    const fingerprint = syncLogic.calculateFingerprint(supabaseRecord);
+    // Store fingerprint to prevent infinite loops (using ONLY headers for stability)
+    const fingerprint = syncLogic.calculateFingerprint(supabaseRecord, headers);
     await redis.set(`lastfingerprint:${table}:${rowId}`, fingerprint, 'EX', 3600);
     
     res.status(200).send("OK");
