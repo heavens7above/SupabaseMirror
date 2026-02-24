@@ -235,30 +235,37 @@ app.post("/sheets-webhook", async (req, res) => {
     const rowId = row[idIndex];
     if (!rowId) return res.status(400).send("No row ID found in the detected column");
 
-    logger.info(`Processing Sheets Update: table=${table} rowId=${rowId}`);
-
-    // PRE-UPSERT DEDUPLICATION:
-    // Map the incoming data and check if it matches the last state we processed.
-    const incomingRecord = syncLogic.mapSheetsToSupabase(row, headers);
-    const incomingFingerprint = syncLogic.calculateFingerprint(incomingRecord, headers);
-    const lastFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
-
-    if (incomingFingerprint === lastFingerprint) {
-      logger.info(`Dropping duplicate/local-echo Sheets update for ${rowId}`);
-      return res.status(200).send("Dropped (Duplicate)");
+    // BURST PROTECTION: Stop Sheet firehose (multiple onEdit events for one change)
+    const lockKey = `sheets_processing:${table}:${rowId}`;
+    const acquired = await redis.set(lockKey, 'true', 'EX', 5, 'NX');
+    if (!acquired) {
+      logger.info(`Sheets Burst Protection: Already processing ${table}:${rowId}. skipping.`);
+      return res.status(200).send("OK (Burst Protected)");
     }
 
-    // CONFLICT RESOLUTION:
-    // If Supabase is newer, check if we're actually changing anything.
-    const { data: currentRecord } = await pRetry(
-      () =>
-        supabase
-          .from(table)
-          .select("synced_at")
-          .eq("id", rowId)
-          .single(),
-      { retries: 3 },
-    );
+    try {
+      logger.info(`Processing Sheets Update: table=${table} rowId=${rowId}`);
+
+      // PRE-UPSERT DEDUPLICATION:
+      const incomingRecord = syncLogic.mapSheetsToSupabase(row, headers);
+      const incomingFingerprint = syncLogic.calculateFingerprint(incomingRecord, headers);
+      const lastFingerprint = await redis.get(`lastfingerprint:${table}:${rowId}`);
+
+      if (incomingFingerprint === lastFingerprint) {
+        logger.info(`Dropping duplicate/local-echo Sheets update for ${rowId}`);
+        return res.status(200).send("Dropped (Duplicate)");
+      }
+
+      // CONFLICT RESOLUTION:
+      const { data: currentRecord } = await pRetry(
+        () =>
+          supabase
+            .from(table)
+            .select("synced_at")
+            .eq("id", rowId)
+            .single(),
+        { retries: 3 },
+      );
 
     if (currentRecord && currentRecord.synced_at) {
       const supabaseSyncedAt = new Date(currentRecord.synced_at);
@@ -295,6 +302,10 @@ app.post("/sheets-webhook", async (req, res) => {
     await redis.set(`lastfingerprint:${table}:${rowId}`, incomingFingerprint, 'EX', 3600);
     
     res.status(200).send("OK");
+    } finally {
+      // Clear burst lock slowly to allow firehose to drain
+      setTimeout(() => redis.del(lockKey).catch(() => {}), 2000);
+    }
   } catch (error) {
     await logSyncError("sheets", req.body, error);
     res.status(500).send("Internal Server Error");
